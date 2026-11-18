@@ -1,0 +1,80 @@
+name: Build & Release Standalone
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag (留空自动按版本号与当前日期生成)'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build CreditDaddy Standalone Bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Generate Build Info
+        run: |
+          if [ -f scripts/gen-build-info.js ]; then
+            node scripts/gen-build-info.js build.json || true
+          fi
+
+      - name: Assemble Package
+        run: |
+          mkdir -p dist
+          cp -r bin dist/
+          cp -r src dist/
+          cp -r assets dist/ 2>/dev/null || true
+          cp package.json dist/
+          cp package-lock.json dist/ 2>/dev/null || true
+          [ -f build.json ] && cp build.json dist/
+          [ -f README.md ] && cp README.md dist/
+          [ -f LICENSE ] && cp LICENSE dist/
+          cd dist
+          zip -r ../creditdaddy-standalone.zip .
+          cd ..
+          ls -la creditdaddy-standalone.zip
+
+      - name: Determine Release Tag & Version
+        id: vars
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            DATE_STR=$(date +'%Y%m%d-%H%M')
+            TAG="v${PKG_VERSION}-${DATE_STR}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${PKG_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release & Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: CreditDaddy ${{ steps.vars.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            creditdaddy-standalone.zip
