@@ -365,6 +365,14 @@ test('会话槽（会话池）：slot 随捕获落 meta.cookieSlot；同身份�
       assert.equal(bad.status, 200);
       assert.equal(bad.body.accountId, id1, '越界槽号归 1，与槽 1 原位轮换');
 
+      // 槽 7（旧上限内的合法号，现退役）→ 同样归 1：上限 6 由 daemon 与桌面壳双侧守卫
+      const s7 = await call('POST', '/api/cookie-sites/tokenharbor/capture', {
+        cookie: 'alive=1', slot: 7, diag: { cookieCount: 1 },
+        probeHtml: '<html>yang@a.com <h1>Free allowance 40%</h1></html>',
+      });
+      assert.equal(s7.status, 200);
+      assert.equal(s7.body.accountId, id1, '槽 7 越界归 1（上限 6，2026-11-19 用户定版）');
+
       // GET /api/cookie-sites 回显槽号（槽 1 缺省也显式回 1，面板徽章零特判）
       const sites = await call('GET', '/api/cookie-sites');
       const row = sites.body.sites.find((x) => x.id === 'tokenharbor');
@@ -444,6 +452,89 @@ test('网页会话账号「刷新积分」（/quota 端点）走重探语义：l
     if (savedProbe === undefined) delete process.env.CD_PROBE_TOKENHARBOR;
     else process.env.CD_PROBE_TOKENHARBOR = savedProbe;
     fake.close();
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+// ── 会话池 persistKey 白名单与站点 id 全表一致性（2026-11-19 用户实测 MiMo 会话槽失效回归钉）──
+// desktop/main.js 的 IPC 校验正则必须认下 COOKIE_SITES 里每一个站点 id 构造出的分区名——
+// [a-z0-9]+ 少了连字符时，xiaomi-mimo 这类带连字符 id 的 persistKey 被静默判非法回落 null，
+// 所有槽开在同一个无痕分区、收割 slot 全缺省成 1（用户会话 2 登录的号全进会话 1）。
+test('会话池 persistKey 白名单认下全部站点 id（含连字符）与槽号组合', async () => {
+  const { COOKIE_SITES } = await import('../src/cookieSites.js');
+  // 与 desktop/main.js open-auth-window / clear-cookie-site-session 的校验保持同一形状；
+  // 这里的字面量是两处 IPC 正则的镜像，改桌面壳时若不同步这里立刻红。
+  // 白名单是「不透传任意值」的字符集闸，不是槽号校验器（槽号语义由构造侧保证）：
+  // x-s10 这类歧义串会命中 id 段，但它构造出的分区与任何真实槽都不同名，读不到别的槽数据。
+  // 槽位上限 6（2026-11-19 用户定版「9 个太多了，6 个合适」）：桌面壳正则只收 -s2..s6
+  const re = /^cookie-site-[a-z0-9-]+-s[2-6]$|^cookie-site-[a-z0-9-]+$/;
+  const offenders = [];
+  for (const site of COOKIE_SITES) {
+    if (!re.test('cookie-site-' + site.id)) offenders.push(site.id + ' (槽1)');
+    for (const s of [2, 5, 6]) {
+      if (!re.test('cookie-site-' + site.id + '-s' + s)) offenders.push(site.id + ' (槽' + s + ')');
+    }
+  }
+  assert.deepEqual(offenders, [], '以下站点 id 的 persistKey 过不了 IPC 白名单: ' + offenders.join(', '));
+  // 反向：非法形态必须仍被拒（不透传任意值的安全语义不因放宽而丢失）。
+  // 注意 cookie-site-x-s1 会整串命中（s1 被 id 段吞掉）——无害：面板构造的槽 1 key 本就不带
+  // 后缀，-s1 形态只可能来自恶意输入，而它构造出的分区与任何真实槽都不同名，等价于开新池。
+  assert.equal(re.test('cookie-site-../evil'), false);
+  assert.equal(re.test(''), false);
+  assert.equal(re.test('cookie-site-x'), true);
+  // 歧义串（x-s10 / x-s2-extra 等）会被 id 段吞掉而命中——无害：它们构造出的分区与任何
+  // 真实槽都不同名，读不到别的槽数据；槽号语义由构造侧（面板只从 COOKIE_SITES.id 拼 key）保证。
+  assert.equal(re.test('cookie-site-x-s10'), true, '歧义串命中无害；槽号上限由构造侧保证');
+  // s7/s9 歧义串被 id 段吞掉而命中——无害（同 x-s10：非真实槽名，读不到别的槽数据）；
+  // 槽 7-9 退役的语义由 daemon capture 端点（slot≤6 归 1）与面板构造侧（候选列表到 6）保证
+  assert.equal(re.test('cookie-site-x-s7'), true, '歧义串命中无害；槽 7 退役由 daemon/构造侧保证');
+});
+
+// ── Meoo 快照保鲜（2026-11-19 用户实测「都是手动领取+手动刷新，没有定时刷新」回归钉）──
+// meoo 不推卡（no10rSync），被推送循环排除后快照只在捕获时与手动 ?live=1 更新——
+// 现在推送循环里补了只拉不推的保鲜段（与灵犀 persistLive 同口径）。
+test('推送循环为 meoo 账号保鲜快照：有效会话落余额+grants+探活绿，失效会话只落探活红不碰快照', async () => {
+  const savedHome = process.env.CREDITDADDY_HOME;
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cd-meoo-fresh-'));
+  process.env.CREDITDADDY_HOME = home;
+  try {
+    const store = await import('../src/store.js');
+    const oldAt = '2026-11-10T00:00:00.000Z';
+    await store.saveAccounts([
+      { id: 'm-ok', provider: 'meoo', name: 'Meoo 活号', meta: { cookieSiteId: 'meoo', cookieSiteSession: { cookie: 'a=b' }, quotaSnapshot: { used: 0, total: 500, at: oldAt } } },
+      { id: 'm-dead', provider: 'meoo', name: 'Meoo 死号', meta: { cookieSiteId: 'meoo', cookieSiteSession: { cookie: 'dead=1' }, quotaSnapshot: { used: 0, total: 500, at: oldAt } } },
+    ]);
+    const fake = async (url) => {
+      if (String(url).includes('entitlement/get')) {
+        // 两号同 mock 无法区分——按 cookie 头分流
+        return null;   // 占位：下方用闭包按账号分流（见 fetchImpl 传入两次调用）
+      }
+      return new Response('{}', { status: 404 });
+    };
+    const { runQuotaPush } = await import('../src/externalQuota.js');
+    // 活号轮（fake 返回有效权益）
+    const fakeOk = async () => new Response(JSON.stringify({
+      success: true,
+      data: { userPointInfo: { account: { availableBalance: 78983 }, activeGrants: [{ source: 'DAILY_LOGIN', total: 100, remaining: 60, expireAt: '2026-11-25T00:00:00Z' }] }, planCode: 'FREE' },
+    }), { status: 200 });
+    await runQuotaPush({ endpoint: 'http://127.0.0.1:1', key: 'x', accounts: await store.loadAccounts(), fetchImpl: fakeOk });
+    await new Promise((r) => setTimeout(r, 300));
+    const okRow = (await store.loadAccounts()).find((x) => x.id === 'm-ok');
+    assert.equal(okRow.meta.quotaSnapshot.total, 78983, '活号快照被保鲜更新（500 → 78983）');
+    assert.equal(Boolean(okRow.meta.meooGrants), true, 'grants 明细随保鲜落盘');
+    assert.equal(okRow.meta.lastProbe?.ok, true, '探活转绿');
+    assert.notEqual(okRow.meta.quotaSnapshot.at, oldAt, '快照时间戳刷新');
+
+    // 死号轮（401 NEED_LOGIN）
+    const fake401 = async () => new Response(JSON.stringify({ errCode: 'NEED_LOGIN' }), { status: 401 });
+    await store.saveAccounts([{ id: 'm-dead2', provider: 'meoo', name: 'Meoo 死号2', meta: { cookieSiteId: 'meoo', cookieSiteSession: { cookie: 'dead=1' }, quotaSnapshot: { used: 0, total: 500, at: oldAt } } }]);
+    await runQuotaPush({ endpoint: 'http://127.0.0.1:1', key: 'x', accounts: await store.loadAccounts(), fetchImpl: fake401 });
+    await new Promise((r) => setTimeout(r, 300));
+    const deadRow = (await store.loadAccounts()).find((x) => x.id === 'm-dead2');
+    assert.equal(deadRow.meta.lastProbe?.ok, false, '死号探活转红');
+    assert.equal(deadRow.meta.quotaSnapshot.total, 500, '死号快照不被触碰（保留旧数字）');
+  } finally {
+    process.env.CREDITDADDY_HOME = savedHome;
     await fs.rm(home, { recursive: true, force: true });
   }
 });

@@ -88,6 +88,31 @@ async function boot() {
     // （Chromium 自带的 sec-fetch-*/Origin 头反而成为风控指纹），zcodePlanCompletion 保留备用
     const store = await load('src/store.js');
     const constants = await load('src/constants.js');
+    // 账号凭据静态加密（纵深防御）：32B 随机密钥由 safeStorage（Windows=DPAPI 绑当前用户）
+    // 加密存 userData/secret.key，明文只活在内存；注入 store.js 后壳与同进程 daemon 的
+    // accounts.json 读写全部走 AES-256-GCM 信封。safeStorage 不可用（Linux 无 keyring 等）
+    // → 不注入，回退明文 0600（现状），绝不摆烂报错挡启动。CLI/NAS 实例无此密钥：
+    // 读到密文会明示报错而不是静默清空——桌面版是唯一写入方，口径一致。
+    try {
+      const keyFile = path.join(app.getPath('userData'), 'secret.key');
+      let keyBytes = null;
+      if (safeStorage.isEncryptionAvailable() === true) {
+        if (fs.existsSync(keyFile)) {
+          keyBytes = safeStorage.decryptString(fs.readFileSync(keyFile));
+        } else {
+          keyBytes = crypto.randomBytes(32);
+          fs.writeFileSync(keyFile, safeStorage.encryptString(keyBytes), { mode: 0o600 });
+        }
+        if (Buffer.isBuffer(keyBytes) && keyBytes.length === 32) {
+          store.setAccountsCipher({ keyBytes: () => keyBytes });
+          console.log('[secret] accounts.json 静态加密已启用（safeStorage/DPAPI）');
+        }
+      } else {
+        console.log('[secret] safeStorage 不可用——accounts.json 保持 0600 明文（现状回退）');
+      }
+    } catch (e) {
+      console.error('[secret] 密钥初始化失败，回退明文：', e?.message || e);
+    }
     // 局域网网关：设置开启后绑定 0.0.0.0（面板访问密码开启时才建议，/gateway/* 数据面有自己的密钥）
     const bootSettings = await store.loadSettings();
     const anyLan = bootSettings.zcodeGatewayLan === true
@@ -721,7 +746,7 @@ async function openIncognitoWindow(url, { persistKey } = {}) {
   const isPersist = Boolean(persistKey);
   // 会话槽号（持久分区才有意义）：cookie-site-<id>-sN → N；基础分区 = 槽 1。
   // 收割上报要带它（daemon 落 meta.cookieSlot），面板行上才能按槽显示「会话 N」。
-  const cookieSlot = (() => { const m = /-s([2-9])$/.exec(persistKey || ''); return m ? Number(m[1]) : 1; })();
+  const cookieSlot = (() => { const m = /-s([2-6])$/.exec(persistKey || ''); return m ? Number(m[1]) : 1; })();
   // 按 IP 识别地区的站点（qoder.com 国际版 + cookie-site 捕获窗，如 Token Harbor 对大陆/港澳封锁）：
   // 配置了出口代理时登录窗显式走它；未配置则保持默认（Electron 窗口本来就跟随系统代理，不覆盖）。
   // 登录窗与 daemon 探测同走「网络出口（全局）」——两边出口 IP 一致，避免窗内登录成功、
@@ -978,7 +1003,7 @@ async function harvestCookieSiteSession(ses, site, slot = 1) {
     body: JSON.stringify({
       cookie,
       storage,
-      slot: Number(slot) >= 1 && Number(slot) <= 9 ? Math.trunc(Number(slot)) : 1,
+      slot: Number(slot) >= 1 && Number(slot) <= 6 ? Math.trunc(Number(slot)) : 1,
       // 名字 only（值不进日志）——刷新兑换失败时一眼看出会话 cookie 在不在
       diag: { cookieCount: (all || []).length, storageCount, cookieNames: (all || []).map((c) => c.name) },
       probeHtml,
@@ -1625,7 +1650,10 @@ function registerAuthWindowIpc() {
     }
     // persistKey 只接受内部约定的命名（cookie-site-<站点id> / cookie-site-<站点id>-s<槽号>），
     // 不透传任意值。槽 1 不带后缀（= 既有分区，存量登录态零迁移），槽 N≥2 带 -sN。
-    const persistKey = opts && typeof opts.persistKey === 'string' && /^cookie-site-[a-z0-9]+(-s[2-9])?$/.test(opts.persistKey)
+    // 站点 id 含连字符（xiaomi-mimo 等）——[a-z0-9] 不认会静默回落 null = 所有槽开同一个
+    // 无痕分区、收割 slot 全缺省成 1（2026-11-19 用户实测 MiMo 会话 2 登录全进会话 1 的根因）。
+    // 槽号语义由构造侧（面板只从 COOKIE_SITES.id 拼 key）保证；这里只拦越权字符。
+    const persistKey = opts && typeof opts.persistKey === 'string' && /^cookie-site-[a-z0-9-]+-s[2-6]$|^cookie-site-[a-z0-9-]+$/.test(opts.persistKey)
       ? opts.persistKey : null;
     try { await openIncognitoWindow(url, { persistKey }); return { ok: true }; }
     catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
@@ -1633,8 +1661,8 @@ function registerAuthWindowIpc() {
   // 「清除已存会话」：抹掉某站点的持久登录分区存储（面板站点行入口；nodeIntegration 关闭，
   // 主进程代为执行）。返回是否确实存在过该分区。
   ipcMain.handle('clear-cookie-site-session', async (_e, persistKey) => {
-    // 槽 N≥2 的分区（cookie-site-<id>-sN）一并接受——「会话池」可清单个槽
-    if (typeof persistKey !== 'string' || !/^cookie-site-[a-z0-9]+(-s[2-9])?$/.test(persistKey)) {
+    // 槽 N≥2 的分区（cookie-site-<id>-sN）一并接受——「会话池」可清单个槽（id 可含连字符，同上）
+    if (typeof persistKey !== 'string' || !/^cookie-site-[a-z0-9-]+-s[2-6]$|^cookie-site-[a-z0-9-]+$/.test(persistKey)) {
       return { ok: false, error: Tt('无效的会话标识') };
     }
     // 同名窗还开着时先关掉（否则清完它一份内存缓存又写回去）
